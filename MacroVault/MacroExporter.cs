@@ -19,122 +19,177 @@ public sealed class MacroExporter : IDisposable
     private readonly IPluginLog _log;
     private readonly HttpClient _http;
 
-    private const int MacrosPerSet = 100;
-    private const int MaxDiscordLength = 2000;
+    private const int MacrosPerSet    = 100;
+    private const int MaxDiscordChars = 2000;
 
     public MacroExporter(Configuration config, IPluginLog log)
     {
         _config = config;
-        _log = log;
-        _http = new HttpClient(new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromMinutes(5) });
+        _log    = log;
+        _http   = new HttpClient(new SocketsHttpHandler { PooledConnectionLifetime = TimeSpan.FromMinutes(5) });
     }
 
     public void Dispose() => _http.Dispose();
 
     // ── Public entry points ───────────────────────────────────────────────────
 
-    /// <summary>Export the macro that is currently open/selected in the Macro UI.</summary>
+    /// <summary>Export the macro currently open/selected in the Macro UI.</summary>
     public async Task<string> ExportSelectedAsync()
     {
         if (string.IsNullOrWhiteSpace(_config.WebhookUrl))
-            return "No webhook URL configured. Use /mv config to set one.";
+            return "No webhook URL configured. Use /mv to open settings.";
 
-        var (set, index, text) = GetSelectedMacroText();
-        if (text == null)
+        MacroInfo? info = GetSelectedMacroInfo();
+        if (info == null)
             return "No macro is currently selected, or the selected macro is empty.";
 
-        string setName = set == 0 ? "Individual" : "Shared";
-        string message = $"**[{setName}] Macro {index + 1}**\n{text}";
-
-        var result = await PostToDiscordAsync(message);
-        return result ? $"Exported [{setName}] Macro {index + 1} to Discord." : "Failed to post to Discord. Check your webhook URL.";
+        string message = FormatMacro(info, queuePosition: null);
+        bool ok = await PostToDiscordAsync(message);
+        return ok
+            ? $"Exported {info.DisplayLabel} to Discord."
+            : "Failed to post to Discord. Check your webhook URL.";
     }
 
-    /// <summary>Export all non-empty macros from both Individual and Shared tabs.</summary>
+    /// <summary>Export all non-empty macros from both tabs in slot order.</summary>
     public async Task<string> BackupAllAsync()
     {
         if (string.IsNullOrWhiteSpace(_config.WebhookUrl))
-            return "No webhook URL configured. Use /mv config to set one.";
+            return "No webhook URL configured. Use /mv to open settings.";
 
-        var lines = CollectAllMacroLines();
-        if (lines.Count == 0)
+        var macros = ReadAllMacros();
+        if (!_config.IncludeUnnamedMacros)
+            macros.RemoveAll(m => string.IsNullOrWhiteSpace(m.Name));
+
+        if (macros.Count == 0)
             return "No non-empty macros found to backup.";
 
-        var chunks = SplitIntoChunks(lines);
+        var formatted = macros.ConvertAll(m => FormatMacro(m, queuePosition: null));
+        var chunks = BuildChunks(formatted, header: null);
+
         int sent = 0;
         foreach (var chunk in chunks)
         {
             if (!await PostToDiscordAsync(chunk))
-                return $"Backup partially failed after {sent} message(s). Check your webhook URL.";
+                return $"Backup partially failed after {sent} message(s). Check webhook URL.";
             sent++;
         }
-
-        return $"Backup complete — sent {sent} Discord message(s).";
+        return $"Backup complete — {macros.Count} macro(s) in {sent} Discord message(s).";
     }
 
-    // ── Macro reading ─────────────────────────────────────────────────────────
-
-    private unsafe (uint set, uint index, string? text) GetSelectedMacroText()
+    /// <summary>
+    /// Export a user-ordered list of macros with an optional set title.
+    /// The title appears as a bold header in Discord; macros are numbered by queue position.
+    /// </summary>
+    public async Task<string> ExportSetAsync(List<MacroInfo> items, string setTitle)
     {
-        var agent = (AgentMacro*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Macro);
-        if (agent == null) return (0, 0, null);
+        if (string.IsNullOrWhiteSpace(_config.WebhookUrl))
+            return "No webhook URL configured. Use /mv to open settings.";
+        if (items.Count == 0)
+            return "The export queue is empty.";
 
-        uint set   = agent->SelectedMacroSet;
-        uint index = agent->SelectedMacroIndex;
+        string? header = string.IsNullOrWhiteSpace(setTitle)
+            ? null
+            : $"**\u2500\u2500 {setTitle.Trim()} \u2500\u2500**";
 
-        var module = RaptureMacroModule.Instance();
-        if (module == null) return (set, index, null);
+        var formatted = new List<string>(items.Count);
+        for (int i = 0; i < items.Count; i++)
+            formatted.Add(FormatMacro(items[i], queuePosition: i + 1));
 
-        var macro = module->GetMacro(set, index);
-        if (macro == null || !macro->IsNotEmpty()) return (set, index, null);
+        var chunks = BuildChunks(formatted, header);
 
-        return (set, index, FormatMacro(set, index, macro));
+        int sent = 0;
+        foreach (var chunk in chunks)
+        {
+            if (!await PostToDiscordAsync(chunk))
+                return $"Export partially failed after {sent} message(s). Check webhook URL.";
+            sent++;
+        }
+        return $"Exported {items.Count} macro(s){(string.IsNullOrWhiteSpace(setTitle) ? "" : $" as \"{setTitle.Trim()}\"")} in {sent} Discord message(s).";
     }
 
-    private unsafe List<string> CollectAllMacroLines()
-    {
-        var module = RaptureMacroModule.Instance();
-        if (module == null) return [];
+    // ── Game memory reads ─────────────────────────────────────────────────────
 
-        var entries = new List<string>();
+    /// <summary>Read all non-empty macro slots from both sets into MacroInfo objects.</summary>
+    public unsafe List<MacroInfo> ReadAllMacros()
+    {
+        var result = new List<MacroInfo>();
+        var module = RaptureMacroModule.Instance();
+        if (module == null) return result;
 
         for (uint set = 0; set <= 1; set++)
         {
-            string setName = set == 0 ? "Individual" : "Shared";
             for (uint idx = 0; idx < MacrosPerSet; idx++)
             {
                 var macro = module->GetMacro(set, idx);
                 if (macro == null || !macro->IsNotEmpty()) continue;
 
-                string name = macro->Name.ToString();
-                if (!_config.IncludeUnnamedMacros && string.IsNullOrWhiteSpace(name)) continue;
+                var lines = new List<string>(15);
+                for (int i = 0; i < 15; i++)
+                {
+                    string line = macro->Lines[i].ToString();
+                    if (!string.IsNullOrWhiteSpace(line)) lines.Add(line);
+                }
 
-                entries.Add(FormatMacro(set, idx, macro));
+                result.Add(new MacroInfo
+                {
+                    Set   = set,
+                    Index = idx,
+                    Name  = macro->Name.ToString(),
+                    Lines = lines.ToArray(),
+                });
             }
         }
-
-        return entries;
+        return result;
     }
 
-    private static unsafe string FormatMacro(uint set, uint index, RaptureMacroModule.Macro* macro)
+    private unsafe MacroInfo? GetSelectedMacroInfo()
     {
-        string setName = set == 0 ? "Individual" : "Shared";
-        string name    = macro->Name.ToString();
+        var agent = (AgentMacro*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Macro);
+        if (agent == null) return null;
 
-        var sb = new StringBuilder();
+        uint set   = agent->SelectedMacroSet;
+        uint index = agent->SelectedMacroIndex;
 
-        if (string.IsNullOrWhiteSpace(name))
-            sb.AppendLine($"**[{setName}] Macro {index + 1}**");
-        else
-            sb.AppendLine($"**[{setName}] Macro {index + 1} \u2014 {name}**");
+        var module = RaptureMacroModule.Instance();
+        if (module == null) return null;
 
-        sb.AppendLine("```");
+        var macro = module->GetMacro(set, index);
+        if (macro == null || !macro->IsNotEmpty()) return null;
+
+        var lines = new List<string>(15);
         for (int i = 0; i < 15; i++)
         {
             string line = macro->Lines[i].ToString();
-            if (!string.IsNullOrWhiteSpace(line))
-                sb.AppendLine(line);
+            if (!string.IsNullOrWhiteSpace(line)) lines.Add(line);
         }
+
+        return new MacroInfo
+        {
+            Set   = set,
+            Index = index,
+            Name  = macro->Name.ToString(),
+            Lines = lines.ToArray(),
+        };
+    }
+
+    // ── Formatting ────────────────────────────────────────────────────────────
+
+    private static string FormatMacro(MacroInfo info, int? queuePosition)
+    {
+        var sb = new StringBuilder();
+
+        // Header line — e.g.  **2. [Individual] #5 — My Macro**
+        sb.Append("**");
+        if (queuePosition.HasValue)
+            sb.Append($"{queuePosition}. ");
+        sb.Append($"[{info.SetName}] {info.SlotLabel}");
+        if (!string.IsNullOrWhiteSpace(info.Name))
+            sb.Append($" \u2014 {info.Name}");
+        sb.AppendLine("**");
+
+        sb.AppendLine("```");
+        foreach (var line in info.Lines)
+            sb.AppendLine(line);
         sb.Append("```");
 
         return sb.ToString();
@@ -143,25 +198,32 @@ public sealed class MacroExporter : IDisposable
     // ── Chunking ──────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Splits a list of formatted macro strings into Discord messages that each
-    /// stay within the 2000-character limit.
+    /// Pack formatted macro strings into Discord messages that stay under 2000 chars.
+    /// If a header is provided it is prepended to the first chunk.
     /// </summary>
-    private static List<string> SplitIntoChunks(List<string> entries)
+    private static List<string> BuildChunks(List<string> entries, string? header)
     {
-        var chunks = new List<string>();
+        var chunks  = new List<string>();
         var current = new StringBuilder();
+
+        if (!string.IsNullOrEmpty(header))
+        {
+            current.AppendLine(header);
+            current.AppendLine();
+        }
 
         foreach (var entry in entries)
         {
-            // Single entry too long — truncate with a note.
-            if (entry.Length > MaxDiscordLength)
+            // Single entry larger than limit — truncate
+            if (entry.Length > MaxDiscordChars)
             {
-                string truncated = entry[..(MaxDiscordLength - 20)] + "\n…(truncated)```";
-                chunks.Add(truncated);
+                if (current.Length > 0) { chunks.Add(current.ToString()); current.Clear(); }
+                chunks.Add(entry[..(MaxDiscordChars - 22)] + "\n\u2026(truncated)```");
                 continue;
             }
 
-            if (current.Length + entry.Length + 1 > MaxDiscordLength)
+            int needed = current.Length + (current.Length > 0 ? 1 : 0) + entry.Length;
+            if (needed > MaxDiscordChars)
             {
                 chunks.Add(current.ToString());
                 current.Clear();
@@ -186,7 +248,7 @@ public sealed class MacroExporter : IDisposable
             var payload = JsonSerializer.Serialize(new
             {
                 content,
-                username = string.IsNullOrWhiteSpace(_config.BotUsername) ? "MacroVault" : _config.BotUsername
+                username = string.IsNullOrWhiteSpace(_config.BotUsername) ? "MacroVault" : _config.BotUsername,
             });
 
             using var response = await _http.PostAsync(
